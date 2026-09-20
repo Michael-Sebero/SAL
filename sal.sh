@@ -20,6 +20,7 @@ DEFAULT_KEYMAP="us"
 TARGET="/mnt"
 EFI_SIZE="1024M"                 
 BIOS_BOOT_SIZE="1M"              
+BOOT_SIZE="1024M"
 SWAP_SIZE="15G"                  
 USER_GROUPS="wheel,audio,video,input,storage,optical,lp,scanner,network,users,kvm,render"
 EXTRA_PACKAGES=(pipewire pipewire-pulse pipewire-alsa wireplumber librewolf)
@@ -37,7 +38,7 @@ HAVE_DIALOG=0
 WORKDIR=""
 BOOT_MODE=""
 INIT_SYSTEM="" DISTRO="" DISTRO_LABEL="" STRAP_CMD="" CHROOT_CMD="" BOOTLOADER_ID="" INIT_BASE_PKGS=""
-DISK="" BOOT_PART="" SWAP_PART="" ROOT_PART=""
+DISK="" BIOS_BOOT_PART="" BOOT_PART="" SWAP_PART="" ROOT_PART=""
 GPU_VENDOR="unknown" NVIDIA_TIER="" DE_CHOICE="" FS_CHOICE=""
 NEW_HOSTNAME="" NEW_USER="" USER_PASS="" ROOT_PASS=""
 ENCRYPT="no" LUKS_UUID="" LUKS_PASS=""
@@ -285,15 +286,15 @@ detect_boot_mode() {
 
 detect_gpu() {
   local pci; pci=$(lspci -nnk 2>/dev/null | grep -iE 'vga|3d|display' || true)
-  if   grep -qiE 'amd|ati|advanced micro devices|radeon' <<<"$pci"; then GPU_VENDOR="amd"
-  elif grep -qi 'intel' <<<"$pci"; then GPU_VENDOR="intel"
-  elif grep -qi 'nvidia' <<<"$pci"; then
+  if grep -qi 'nvidia' <<<"$pci"; then
     GPU_VENDOR="nvidia"
-    if grep -qiE 'rtx|gtx *16[3-9][0-9]' <<<"$pci"; then
+    if grep -qiE 'rtx|gtx *16[0-9][0-9]' <<<"$pci"; then
       NVIDIA_TIER="rtx"
     else
       NVIDIA_TIER="legacy"
     fi
+  elif grep -qiE 'amd|ati|advanced micro devices|radeon' <<<"$pci"; then GPU_VENDOR="amd"
+  elif grep -qi 'intel' <<<"$pci"; then GPU_VENDOR="intel"
   else GPU_VENDOR="unknown"
   fi
 }
@@ -586,9 +587,16 @@ select_drive() {
     "This will ERASE ALL DATA on $DISK and install $DISTRO_LABEL ($INIT_SYSTEM, $BOOT_MODE).\n\nContinue?" 10 60 1>/dev/tty \
     || die "Aborted — disk not touched."
 
-  BOOT_PART=$(part_path "$DISK" 1)
-  SWAP_PART=$(part_path "$DISK" 2)
-  ROOT_PART=$(part_path "$DISK" 3)
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    BOOT_PART=$(part_path "$DISK" 1)
+    SWAP_PART=$(part_path "$DISK" 2)
+    ROOT_PART=$(part_path "$DISK" 3)
+  else
+    BIOS_BOOT_PART=$(part_path "$DISK" 1)
+    BOOT_PART=$(part_path "$DISK" 2)
+    SWAP_PART=$(part_path "$DISK" 3)
+    ROOT_PART=$(part_path "$DISK" 4)
+  fi
 }
 
 select_filesystem() {
@@ -648,7 +656,8 @@ wait_for_device() {
 
 partitions_present() {
   local dev
-  for dev in "$BOOT_PART" "$SWAP_PART" "$ROOT_PART"; do
+  for dev in "$BIOS_BOOT_PART" "$BOOT_PART" "$SWAP_PART" "$ROOT_PART"; do
+    [ -n "$dev" ] || continue
     [ -b "$dev" ] || return 1
   done
   return 0
@@ -760,11 +769,14 @@ do_partitioning() {
   echo "Partitioning $DISK ($BOOT_MODE, ${swap_mib}MiB swap)..."
   if [ "$BOOT_MODE" = "uefi" ]; then
     sgdisk -n 1:0:"+$EFI_SIZE" -t 1:ef00 -c 1:"EFI System" "$DISK"
+    sgdisk -n 2:0:"+${swap_mib}M" -t 2:8200 -c 2:"Linux swap" "$DISK"
+    sgdisk -n 3:0:0               -t 3:8300 -c 3:"Linux root" "$DISK"
   else
     sgdisk -n 1:0:"+$BIOS_BOOT_SIZE" -t 1:ef02 -c 1:"BIOS boot" "$DISK"
+    sgdisk -n 2:0:"+$BOOT_SIZE"      -t 2:ea00 -c 2:"Linux extended boot" "$DISK"
+    sgdisk -n 3:0:"+${swap_mib}M"    -t 3:8200 -c 3:"Linux swap" "$DISK"
+    sgdisk -n 4:0:0                  -t 4:8300 -c 4:"Linux root" "$DISK"
   fi
-  sgdisk -n 2:0:"+${swap_mib}M" -t 2:8200 -c 2:"Linux swap" "$DISK"
-  sgdisk -n 3:0:0               -t 3:8300 -c 3:"Linux root" "$DISK"
   reread_partition_table "$DISK"
 
   local attempt
@@ -785,13 +797,17 @@ do_partitioning() {
 
   echo "Clearing stale signatures on the new partitions..."
   local part
-  for part in "$BOOT_PART" "$SWAP_PART" "$ROOT_PART"; do
+  for part in "$BIOS_BOOT_PART" "$BOOT_PART" "$SWAP_PART" "$ROOT_PART"; do
+    [ -n "$part" ] || continue
     wipefs -af "$part" >/dev/null 2>&1 || true
   done
 
   if [ "$BOOT_MODE" = "uefi" ]; then
     echo "Formatting ESP..."
     mkfs.fat -F32 -n EFI "$BOOT_PART" || return 1
+  else
+    echo "Formatting boot partition..."
+    mkfs.fat -F32 -n BOOT "$BOOT_PART" || return 1
   fi
 
   echo "Creating swap..."
@@ -829,6 +845,9 @@ do_partitioning() {
   if [ "$BOOT_MODE" = "uefi" ]; then
     mkdir -p "$TARGET/boot/efi"
     mount -t vfat "$BOOT_PART" "$TARGET/boot/efi" || return 1
+  else
+    mkdir -p "$TARGET/boot"
+    mount -t vfat "$BOOT_PART" "$TARGET/boot" || return 1
   fi
 }
 
