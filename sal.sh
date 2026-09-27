@@ -38,7 +38,7 @@ HAVE_DIALOG=0
 WORKDIR=""
 BOOT_MODE=""
 INIT_SYSTEM="" DISTRO="" DISTRO_LABEL="" STRAP_CMD="" CHROOT_CMD="" BOOTLOADER_ID="" INIT_BASE_PKGS=""
-DISK="" BIOS_BOOT_PART="" BOOT_PART="" SWAP_PART="" ROOT_PART=""
+DISK="" BIOS_BOOT_PART="" BOOT_PART="" SWAP_PART="" ROOT_PART="" SWAP_PARTUUID=""
 GPU_VENDOR="unknown" NVIDIA_TIER="" DE_CHOICE="" FS_CHOICE=""
 NEW_HOSTNAME="" NEW_USER="" USER_PASS="" ROOT_PASS=""
 ENCRYPT="no" LUKS_UUID="" LUKS_PASS=""
@@ -769,12 +769,12 @@ do_partitioning() {
   echo "Partitioning $DISK ($BOOT_MODE, ${swap_mib}MiB swap)..."
   if [ "$BOOT_MODE" = "uefi" ]; then
     sgdisk -n 1:0:"+$EFI_SIZE" -t 1:ef00 -c 1:"EFI System" "$DISK"
-    sgdisk -n 2:0:"+${swap_mib}M" -t 2:8200 -c 2:"Linux swap" "$DISK"
+    sgdisk -n 2:0:"+${swap_mib}M" -t 2:8200 -c 2:"Linux swap" -u 2:"$SWAP_PARTUUID" "$DISK"
     sgdisk -n 3:0:0               -t 3:8300 -c 3:"Linux root" "$DISK"
   else
     sgdisk -n 1:0:"+$BIOS_BOOT_SIZE" -t 1:ef02 -c 1:"BIOS boot" "$DISK"
     sgdisk -n 2:0:"+$BOOT_SIZE"      -t 2:ea00 -c 2:"Linux extended boot" "$DISK"
-    sgdisk -n 3:0:"+${swap_mib}M"    -t 3:8200 -c 3:"Linux swap" "$DISK"
+    sgdisk -n 3:0:"+${swap_mib}M"    -t 3:8200 -c 3:"Linux swap" -u 3:"$SWAP_PARTUUID" "$DISK"
     sgdisk -n 4:0:0                  -t 4:8300 -c 4:"Linux root" "$DISK"
   fi
   reread_partition_table "$DISK"
@@ -810,9 +810,15 @@ do_partitioning() {
     mkfs.fat -F32 -n BOOT "$BOOT_PART" || return 1
   fi
 
-  echo "Creating swap..."
-  mkswap -L swap "$SWAP_PART" || return 1
-  swapon "$SWAP_PART" || return 1
+  # Encrypted installs get a random-key swap at every boot, so nothing is ever
+  # paged to the plain partition, not even during the install.
+  if [ "$ENCRYPT" = "yes" ]; then
+    echo "Swap left unformatted; it is encrypted with a fresh random key at every boot."
+  else
+    echo "Creating swap..."
+    mkswap -L swap "$SWAP_PART" || return 1
+    swapon "$SWAP_PART" || return 1
+  fi
 
   local root_target="$ROOT_PART"
   if [ "$ENCRYPT" = "yes" ]; then
@@ -1121,10 +1127,11 @@ do_bootstrap() {
   "$fstab_cmd" -U "$TARGET" >> "$TARGET/etc/fstab" || return 1
 
   sed -i -e 's/flush_merge,//' -e 's/,flush_merge//' -e 's/\bflush_merge\b//' "$TARGET/etc/fstab"
+  if [ "$ENCRYPT" = "yes" ]; then
+    printf '/dev/mapper/cryptswap\tnone\tswap\tdefaults\t0 0\n' >> "$TARGET/etc/fstab"
+  fi
 
   install -d -m 700 "$TARGET/root"
-  printf '%s:%s\nroot:%s\n' "$NEW_USER" "$USER_PASS" "$ROOT_PASS" > "$TARGET/root/.sal-creds"
-  chmod 600 "$TARGET/root/.sal-creds"
 }
 
 write_chroot_script() {
@@ -1143,9 +1150,13 @@ LOCALE="@@LOCALE@@"
 KEYMAP="@@KEYMAP@@"
 DISK="@@DISK@@"
 DE_CHOICE="@@DE_CHOICE@@"
-ROOT_PART="@@ROOT_PART@@"
 ENCRYPT="@@ENCRYPT@@"
 LUKS_UUID="@@LUKS_UUID@@"
+SWAP_PARTUUID="@@SWAP_PARTUUID@@"
+
+# The host pipes "user:pass" lines in on stdin, so passwords never touch the target disk.
+SAL_CREDS=$(cat)
+exec </dev/null
 
 echo "Configuring timezone/clock..."
 if [ -e "/usr/share/zoneinfo/$TIMEZONE" ]; then
@@ -1218,8 +1229,8 @@ grep -q '^[[:space:]]*@includedir /etc/sudoers.d' /etc/sudoers \
   || echo "@includedir /etc/sudoers.d" >> /etc/sudoers
 
 echo "Setting passwords..."
-chpasswd < /root/.sal-creds || { echo "chpasswd failed -- aborting." >&2; exit 1; }
-rm -f /root/.sal-creds
+printf '%s\n' "$SAL_CREDS" | chpasswd || { echo "chpasswd failed -- aborting." >&2; exit 1; }
+unset SAL_CREDS
 
 for acct in root "$NEW_USER"; do
     case "$(passwd -S "$acct" 2>/dev/null | awk '{print $2}')" in
@@ -1228,33 +1239,77 @@ for acct in root "$NEW_USER"; do
     esac
 done
 
+# Arch's mkinitcpio defaults to a systemd-based initramfs, where only sd-encrypt runs;
+# Artix's is busybox-based and uses encrypt.
+SD_INITRAMFS=0
+grep -qE '^HOOKS=\([^)]*\bsystemd\b' /etc/mkinitcpio.conf && SD_INITRAMFS=1
+
 if [ "$ENCRYPT" = "yes" ]; then
-    echo "Embedding a LUKS keyfile into the initramfs..."
-    dd bs=512 count=4 if=/dev/urandom of=/boot/volume.key status=none
-    chmod 000 /boot/volume.key
-    printf '%s' "$LUKS_PASS" | cryptsetup luksAddKey "$ROOT_PART" /boot/volume.key --key-file=- \
-        || { echo "cryptsetup luksAddKey failed -- aborting configuration." >&2; exit 1; }
-
-    echo "cryptroot  UUID=$LUKS_UUID  /boot/volume.key  luks" >> /etc/crypttab
-
-    if ! grep -q '/boot/volume.key' /etc/mkinitcpio.conf; then
-        if grep -q '^FILES=' /etc/mkinitcpio.conf; then
-            sed -i "s#^FILES=(\(.*\))#FILES=(\1 /boot/volume.key)#" /etc/mkinitcpio.conf
-            sed -i 's#^FILES=( #FILES=(#' /etc/mkinitcpio.conf
-        else
-            echo 'FILES=(/boot/volume.key)' >> /etc/mkinitcpio.conf
+    # UEFI: /boot is inside LUKS; the keyfile (added on the host) spares a second prompt after
+    # GRUB's. BIOS: /boot is plain vfat, so no keyfile there; the initramfs asks once.
+    if [ "$BOOT_MODE" = "uefi" ]; then
+        echo "Embedding the LUKS keyfile into the initramfs..."
+        chmod 700 /boot
+        if ! grep -q '/boot/volume.key' /etc/mkinitcpio.conf; then
+            if grep -q '^FILES=' /etc/mkinitcpio.conf; then
+                sed -i "s#^FILES=(\(.*\))#FILES=(\1 /boot/volume.key)#" /etc/mkinitcpio.conf
+                sed -i 's#^FILES=( #FILES=(#' /etc/mkinitcpio.conf
+            else
+                echo 'FILES=(/boot/volume.key)' >> /etc/mkinitcpio.conf
+            fi
         fi
     fi
 
-    if ! grep -qE '^HOOKS=\([^)]*\bencrypt\b' /etc/mkinitcpio.conf; then
-        sed -i 's/\bfilesystems\b/encrypt filesystems/' /etc/mkinitcpio.conf
+    crypt_hook=encrypt
+    [ "$SD_INITRAMFS" -eq 1 ] && crypt_hook=sd-encrypt
+    if ! grep -qE "^HOOKS=\\([^)]*(^|[( ])${crypt_hook}([ )]|\$)" /etc/mkinitcpio.conf; then
+        sed -i "/^HOOKS=/ s/\bfilesystems\b/${crypt_hook} filesystems/" /etc/mkinitcpio.conf
+    fi
+
+    # Swap: new random key every boot. A by-partuuid path, never a /dev/sdX name, because
+    # whatever this opens gets mkswap'd.
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        printf 'cryptswap\t/dev/disk/by-partuuid/%s\t/dev/urandom\tswap,cipher=aes-xts-plain64,size=512\n' "$SWAP_PARTUUID" >> /etc/crypttab
+    else
+        # The mkinitcpio initramfs is the one boot stage OpenRC, runit, s6 and dinit
+        # installs share, so the swap is opened there instead of via a per-init crypttab reader.
+        mkdir -p /etc/initcpio/install /etc/initcpio/hooks
+        cat > /etc/initcpio/install/sal-cryptswap <<'HOOK_EOF'
+#!/bin/bash
+build() {
+    add_binary cryptsetup
+    add_binary mkswap
+    add_module dm-crypt
+    add_runscript
+}
+
+help() {
+    echo "Opens the swap partition with a new random key and runs mkswap on it, every boot."
+}
+HOOK_EOF
+        cat > /etc/initcpio/hooks/sal-cryptswap <<HOOK_EOF
+#!/usr/bin/ash
+run_hook() {
+    dev=/dev/disk/by-partuuid/${SWAP_PARTUUID}
+    if [ ! -b "\$dev" ]; then
+        echo "sal-cryptswap: \$dev not found, encrypted swap skipped"
+        return 0
+    fi
+    cryptsetup open --type plain --key-file /dev/urandom --keyfile-size 64 \\
+        --cipher aes-xts-plain64 --key-size 512 "\$dev" cryptswap \\
+        && mkswap -L cryptswap /dev/mapper/cryptswap >/dev/null
+}
+HOOK_EOF
+        if ! grep -qE '^HOOKS=\([^)]*\bsal-cryptswap\b' /etc/mkinitcpio.conf; then
+            sed -i '/^HOOKS=/ s/\bencrypt\b/encrypt sal-cryptswap/' /etc/mkinitcpio.conf
+        fi
     fi
 fi
 
 echo "Regenerating initramfs..."
 mkinitcpio -P || { echo "mkinitcpio failed -- aborting configuration." >&2; exit 1; }
 
-if [ "$ENCRYPT" = "yes" ]; then
+if [ "$ENCRYPT" = "yes" ] && [ "$BOOT_MODE" = "uefi" ]; then
     grep -q '^GRUB_ENABLE_CRYPTODISK=y' /etc/default/grub 2>/dev/null \
         || echo 'GRUB_ENABLE_CRYPTODISK=y' >> /etc/default/grub
 fi
@@ -1269,8 +1324,15 @@ else
 fi
 
 if [ "$ENCRYPT" = "yes" ] \
-   && ! grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\bcryptdevice=' /etc/default/grub; then
-    sed -i "s#^GRUB_CMDLINE_LINUX_DEFAULT=\"#GRUB_CMDLINE_LINUX_DEFAULT=\"cryptdevice=UUID=$LUKS_UUID:cryptroot cryptkey=rootfs:/boot/volume.key #" /etc/default/grub
+   && ! grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\b(cryptdevice|rd\.luks\.name)=' /etc/default/grub; then
+    if [ "$SD_INITRAMFS" -eq 1 ]; then
+        crypt_args="rd.luks.name=$LUKS_UUID=cryptroot"
+        [ "$BOOT_MODE" = "uefi" ] && crypt_args+=" rd.luks.key=$LUKS_UUID=/boot/volume.key"
+    else
+        crypt_args="cryptdevice=UUID=$LUKS_UUID:cryptroot"
+        [ "$BOOT_MODE" = "uefi" ] && crypt_args+=" cryptkey=rootfs:/boot/volume.key"
+    fi
+    sed -i "s#^GRUB_CMDLINE_LINUX_DEFAULT=\"#GRUB_CMDLINE_LINUX_DEFAULT=\"$crypt_args #" /etc/default/grub
 fi
 
 if ! grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT="([^"]*[[:space:]])?rw([[:space:]][^"]*)?"' /etc/default/grub; then
@@ -1279,8 +1341,8 @@ fi
 
 grub-mkconfig -o /boot/grub/grub.cfg || { echo "grub-mkconfig failed -- aborting configuration." >&2; exit 1; }
 
-if [ "$ENCRYPT" = "yes" ] && ! grep -q 'cryptdevice=' /boot/grub/grub.cfg; then
-    echo "WARNING: /boot/grub/grub.cfg has no cryptdevice= parameter -- the encrypted root will likely fail to unlock at boot." >&2
+if [ "$ENCRYPT" = "yes" ] && ! grep -qE 'cryptdevice=|rd\.luks\.name=' /boot/grub/grub.cfg; then
+    echo "WARNING: /boot/grub/grub.cfg has no cryptdevice=/rd.luks.name= parameter -- the encrypted root will likely fail to unlock at boot." >&2
 fi
 
 if ! grep -qE '(^|[[:space:]])rw([[:space:]]|$)' /boot/grub/grub.cfg; then
@@ -1420,19 +1482,27 @@ CHROOT_SCRIPT_EOF
     -e "s#@@KEYMAP@@#${KEYMAP}#g" \
     -e "s#@@DISK@@#${DISK}#g" \
     -e "s#@@DE_CHOICE@@#${DE_CHOICE}#g" \
-    -e "s#@@ROOT_PART@@#${ROOT_PART}#g" \
     -e "s#@@ENCRYPT@@#${ENCRYPT}#g" \
     -e "s#@@LUKS_UUID@@#${LUKS_UUID}#g" \
+    -e "s#@@SWAP_PARTUUID@@#${SWAP_PARTUUID}#g" \
     "$TARGET/root/sal-configure.sh"
   chmod 700 "$TARGET/root/sal-configure.sh"
 }
 
 do_configure() {
   cp /etc/resolv.conf "$TARGET/etc/resolv.conf" 2>/dev/null || true
+  if [ "$ENCRYPT" = "yes" ] && [ "$BOOT_MODE" = "uefi" ]; then
+    echo "Adding an initramfs keyfile to the LUKS header..."
+    ( umask 077; dd bs=512 count=4 if=/dev/urandom of="$TARGET/boot/volume.key" status=none ) || return 1
+    printf '%s' "$LUKS_PASS" | cryptsetup luksAddKey "$ROOT_PART" "$TARGET/boot/volume.key" --key-file=- \
+      || { echo "cryptsetup luksAddKey failed." >&2; return 1; }
+    chmod 000 "$TARGET/boot/volume.key"
+  fi
   write_chroot_script
   echo "Entering chroot to finish configuration..."
-  "$CHROOT_CMD" "$TARGET" /bin/bash /root/sal-configure.sh || return 1
-  rm -f "$TARGET/root/sal-configure.sh" "$TARGET/root/.sal-creds"
+  printf '%s:%s\nroot:%s\n' "$NEW_USER" "$USER_PASS" "$ROOT_PASS" \
+    | "$CHROOT_CMD" "$TARGET" /bin/bash /root/sal-configure.sh || return 1
+  rm -f "$TARGET/root/sal-configure.sh"
 }
 
 finish_screen() {
@@ -1480,6 +1550,7 @@ main() {
 
   transition_screen "Starting installation..."
 
+  SWAP_PARTUUID=$(</proc/sys/kernel/random/uuid)
   run_part "Partitioning $DISK..." do_partitioning
   [ -f "$WORKDIR/luks_uuid" ] && LUKS_UUID=$(<"$WORKDIR/luks_uuid")
 
