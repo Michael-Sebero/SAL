@@ -30,8 +30,19 @@ LOG="/var/tmp/sal-install.log"
 STRAP_MAX_ATTEMPTS=5
 STRAP_RETRY_DELAY=5
 
-RANKMIRRORS_TIMEOUT=60
-RANKMIRRORS_PER_MIRROR_TIMEOUT=5
+RANKMIRRORS_TIMEOUT=300
+RANKMIRRORS_PER_MIRROR_TIMEOUT=3
+
+# Network persistence for the repository setup, which runs before the disk is touched.
+NET_ATTEMPTS=4
+NET_RETRY_DELAY=5
+KEYSERVERS=(hkps://keyserver.ubuntu.com hkp://keyserver.ubuntu.com:80)
+CURL_OPTS=(--fail --silent --show-error --location --connect-timeout 15 --max-time 60)
+CHAOTIC_README_URL="https://raw.githubusercontent.com/chaotic-aur/.github/refs/heads/main/profile/README.md"
+CHAOTIC_FALLBACK_KEY="3056513887B78AEB"     # only used if the README above can't be fetched or parsed
+CHAOTIC_PKG_URL="https://cdn-mirror.chaotic.cx/chaotic-aur"
+AURIS_KEY_URL="https://auris.artixlinux.org/api/packages/auris/arch/repository.key"
+AURIS_KEY_FPR="74E5750C4A3C00F037070EF2357B525A97500B9F"
 
 BACKTITLE="Simple Arch/Artix Linux"
 HAVE_DIALOG=0
@@ -44,7 +55,8 @@ NEW_HOSTNAME="" NEW_USER="" USER_PASS="" ROOT_PASS=""
 ENCRYPT="no" LUKS_UUID="" LUKS_PASS=""
 TIMEZONE="" LOCALE="" KEYMAP=""
 FAILED_PACKAGES=() STRAP_SKIPPED=()
-SKIPPED_PACKAGES=""
+SKIPPED_PACKAGES="" REPO_NOTES=""
+REPO_CHAOTIC=false REPO_AURIS=false REPO_ALHP=false REPO_CPU=""
 
 part_path() { case "$1" in *[0-9]) printf '%sp%s' "$1" "$2" ;; *) printf '%s%s' "$1" "$2" ;; esac; }
 
@@ -77,7 +89,7 @@ die() {
 ask() { dialog "$@" 1>/dev/tty 2>"$WORKDIR/ans"; }
 
 ### PROGRESS DISPLAY (BOX-DRAWN, NO PERCENTAGE GAUGE) ###
-TOTAL_PARTS=3
+TOTAL_PARTS=4
 CURRENT_PART=0
 PROGRESS_BOX_LINES=6
 
@@ -222,8 +234,114 @@ run_part() {
   [ "$rc" -eq 0 ] || die "Step failed: $msg (see $LOG)"
 }
 
+### NETWORK HELPERS ###
+# retry <attempts> <delay-seconds> <command...> - runs the command until it succeeds.
+retry() {
+  local tries="$1" delay="$2" n; shift 2
+  for ((n = 1; n <= tries; n++)); do
+    "$@" && return 0
+    if [ "$n" -lt "$tries" ]; then
+      echo "Attempt $n/$tries failed, retrying in ${delay}s: $*" >&2
+      sleep "$delay"
+    fi
+  done
+  echo "All $tries attempts failed: $*" >&2
+  return 1
+}
+
+# fetch <url> <outfile> - a small download with timeouts and retries; HTTP errors count as failures.
+fetch() { retry "$NET_ATTEMPTS" "$NET_RETRY_DELAY" curl "${CURL_OPTS[@]}" -o "$2" "$1"; }
+
+# Logs which of the hosts this installer depends on can be reached from here, so a failed install
+# can be traced to the real culprit instead of being guessed at.
+net_report() {
+  local host rc
+  echo "Network check ($(date -u '+%F %T') UTC):"
+  for host in archlinux.org raw.githubusercontent.com keyserver.ubuntu.com \
+              cdn-mirror.chaotic.cx geo-mirror.chaotic.cx auris.artixlinux.org aur.archlinux.org; do
+    curl --silent --head --connect-timeout 8 --max-time 15 -o /dev/null "https://$host/" 2>/dev/null
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "  $host: reachable"
+    else
+      echo "  $host: NOT reachable (curl exit code $rc)"
+    fi
+  done
+}
+
+# HTTPS certificates are only valid at the right time, and a freshly booted live ISO can have a
+# wildly wrong clock (dead CMOS battery, or an RTC holding local time). If a normal HTTPS request
+# fails but an unverified one is answered, the time is taken from that server's Date header.
+fix_clock_if_needed() {
+  local hdr
+  hdr=$(curl --silent --insecure --head --connect-timeout 10 --max-time 20 https://archlinux.org 2>/dev/null \
+          | sed -n 's/^[Dd]ate:[[:space:]]*//p' | tr -d '\r' | head -n 1)
+  [ -n "$hdr" ] || return 1
+  echo "HTTPS certificate checks fail although archlinux.org answers, so the clock ($(date -u '+%F %T') UTC) is probably wrong." >&2
+  echo "Setting it from the server's Date header: $hdr" >&2
+  date -u -s "$hdr" >/dev/null 2>&1 || return 1
+  curl --silent --head --connect-timeout 10 --max-time 20 -o /dev/null https://archlinux.org 2>/dev/null
+}
+
+prune_broken_repos() {
+  local conf="${1:-/etc/pacman.conf}" force_re="${2:-}" tmp line name="" body="" drop=0 changed=0 inc
+  local re_section='^[[:space:]]*\[([^]]+)\][[:space:]]*$'
+  local re_include='^[[:space:]]*Include[[:space:]]*=[[:space:]]*([^[:space:]#]+)'
+  [ -r "$conf" ] || return 0
+  tmp=$(mktemp) || return 1
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ $re_section ]]; then
+      if [ "$drop" -eq 1 ]; then
+        changed=1
+      else
+        printf '%s' "$body" >>"$tmp"
+      fi
+      name="${BASH_REMATCH[1]}"; body=""; drop=0
+      if [ -n "$force_re" ] && [[ "$name" =~ $force_re ]]; then
+        echo "pacman.conf: dropping [$name]; it is set up again from scratch further on." >&2
+        drop=1
+      fi
+    elif [ "$name" != "options" ] && [[ "$line" =~ $re_include ]]; then
+      inc="${BASH_REMATCH[1]}"
+      if [ "$drop" -eq 0 ] && ! compgen -G "$inc" >/dev/null; then
+        echo "pacman.conf: dropping [$name], because $inc does not exist." >&2
+        drop=1
+      fi
+    fi
+    body+="$line"$'\n'
+  done <"$conf"
+  if [ "$drop" -eq 1 ]; then changed=1; else printf '%s' "$body" >>"$tmp"; fi
+
+  if [ "$changed" -eq 1 ]; then
+    cat "$tmp" >"$conf"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
 ### PREFLIGHT (PLAIN TERMINAL, DIALOG NOT AVAILABLE YET) ###
 preflight_root() { [ "$(id -u)" -eq 0 ] || { echo "ERROR: run this script as root." >&2; exit 1; }; }
+
+# Everything below needs the internet, so it is checked up front instead of after the questions.
+# (If curl isn't on the ISO yet, preflight_tools installs it and pacman reports any network problem.)
+preflight_network() {
+  local url mirror
+  command -v curl >/dev/null 2>&1 || return 0
+  echo "Checking the internet connection..."
+  echo "Clock: $(date -u '+%F %T') UTC" >>"$LOG"
+  # A few websites first, then the first package mirror: a website can be blocked or slow while the
+  # mirrors, which are what the installation really needs, still work.
+  mirror=$(sed -n 's/^[[:space:]]*Server[[:space:]]*=[[:space:]]*//p' /etc/pacman.d/mirrorlist 2>/dev/null | head -n 1)
+  mirror=${mirror//\$repo/core}; mirror=${mirror//\$arch/x86_64}
+  for url in https://archlinux.org https://artixlinux.org https://github.com $mirror; do
+    curl --silent --show-error --head --connect-timeout 10 --max-time 20 -o /dev/null "$url" 2>>"$LOG" && return 0
+  done
+  fix_clock_if_needed && return 0
+  echo "ERROR: this live session can't reach the internet (tried archlinux.org, artixlinux.org, github.com and the first package mirror)." >&2
+  echo "Connect it to a network (cable, nmtui, iwctl, connmanctl ...), make sure a website opens, then run this script again." >&2
+  exit 1
+}
 
 preflight_cowspace() {
   local cow="/run/archiso/cowspace"
@@ -270,7 +388,7 @@ preflight_tools() {
   command -v gpg         >/dev/null 2>&1 || need+=(gnupg)
   if [ "${#need[@]}" -gt 0 ]; then
     echo "Installing host-side tools: ${need[*]}" >&2
-    pacman -Sy --noconfirm --needed "${need[@]}" \
+    retry 3 "$NET_RETRY_DELAY" pacman -Sy --noconfirm --needed "${need[@]}" \
       || { echo "Could not install required tools. Aborting." >&2; exit 1; }
   fi
   command -v dialog >/dev/null 2>&1 && HAVE_DIALOG=1
@@ -873,7 +991,8 @@ detect_cpu_level() {
 }
 
 write_pacman_conf() {
-  local distro="$1" cpu_level="$2" alhp_ok="$3"
+  local distro="$1" cpu_level="$2" alhp_ok="$3" chaotic_ok="${4:-false}" auris_ok="${5:-false}"
+  local conf="${PACMAN_CONF:-/etc/pacman.conf}"
   local arch_line base_mirrorlist native_repos tiered_repos repo
 
   case "$cpu_level" in
@@ -892,6 +1011,7 @@ write_pacman_conf() {
     base_mirrorlist="/etc/pacman.d/mirrorlist"
   fi
 
+  # Built in a side file and moved into place, so pacman.conf is never left half-written.
   {
     printf '[options]\nHoldPkg     = pacman glibc\nArchitecture = %s\nColor\nParallelDownloads = 10\nSigLevel    = Required DatabaseOptional\nLocalFileSigLevel = Optional\n\n' "$arch_line"
 
@@ -907,77 +1027,266 @@ write_pacman_conf() {
       printf '[%s]\nInclude = %s\n\n' "$repo" "$base_mirrorlist"
     done
 
-    [ "$distro" = "artix" ] && printf '[auris]\nSigLevel = Required\nServer = https://auris.artixlinux.org/api/packages/auris/arch/$repo/$arch\n\n'
+    # Third-party repos are only written once they have been set up AND their databases have been
+    # seen to sync (see setup_repo_integration). A pacman.conf that Includes a file which was never
+    # installed makes every pacman command fail, so such a config is never written.
+    if [ "$distro" = "artix" ] && [ "$auris_ok" = "true" ]; then
+      printf '[auris]\nSigLevel = Required\nServer = https://auris.artixlinux.org/api/packages/auris/arch/$repo/$arch\n\n'
+    fi
+    if [ "$chaotic_ok" = "true" ]; then
+      printf '[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n\n'
+    fi
+  } > "$conf.sal-new" && mv -f "$conf.sal-new" "$conf"
+}
 
-    printf '[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n'
-  } > /etc/pacman.conf
+### REPOSITORY SETUP HELPERS ###
+# pacman with every prompt answered by its default, like everywhere else in this script.
+pacman_yes() { pacman "$@" < <(yes ''); }
+
+# One-line notes for the final screen. The repository setup runs in a subshell (run_part), so they
+# travel back through a file, the same way the skipped-package list does.
+note_repo() {
+  if [ -n "${WORKDIR:-}" ]; then
+    printf '%s\n' "$*" >> "$WORKDIR/repo_notes"
+  fi
+  return 0
+}
+
+repo_setup_failed() {
+  echo "ERROR: the official package databases could not be downloaded. The disk has not been touched." >&2
+  net_report
+}
+
+# Imports one signing key into pacman's keyring. Keyserver ports are often filtered and keyservers go
+# down now and then, so a second keyserver port and a plain HTTPS download are tried as well.
+recv_key() {
+  local key="$1" ks tmp
+  for ks in "${KEYSERVERS[@]}"; do
+    timeout 90 pacman-key --keyserver "$ks" --recv-keys "$key" && return 0
+    echo "Key $key: keyserver $ks did not deliver it." >&2
+  done
+  tmp=$(mktemp) || return 1
+  if curl "${CURL_OPTS[@]}" -o "$tmp" "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${key}" \
+       && grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$tmp" \
+       && pacman-key --add "$tmp"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "Key $key: could not be fetched from any keyserver." >&2
+  return 1
+}
+
+# The key IDs the Chaotic-AUR README tells you to import. If the README can't be fetched or has
+# changed shape, the primary key it has always listed is used instead.
+chaotic_key_ids() {
+  local tmp ids=""
+  tmp=$(mktemp) || { printf '%s\n' "$CHAOTIC_FALLBACK_KEY"; return 0; }
+  if fetch "$CHAOTIC_README_URL" "$tmp"; then
+    ids=$(grep -Eo 'pacman-key --recv-keys? [0-9A-Fa-f]{8,40}' "$tmp" | awk '{print $3}' | sort -u)
+  fi
+  rm -f "$tmp"
+  if [ -z "$ids" ]; then
+    echo "Could not read a key ID from the Chaotic-AUR README; using the built-in one." >&2
+    ids="$CHAOTIC_FALLBACK_KEY"
+  fi
+  printf '%s\n' "$ids"
+}
+
+# Chaotic-AUR exactly as its README sets it up (keys, keyring, mirrorlist), except that every step is
+# retried and nothing is taken for granted. Succeeds only if the mirrorlist file really exists afterwards.
+setup_chaotic() {
+  local key keys=() imported=0
+  mapfile -t keys < <(chaotic_key_ids)
+  for key in "${keys[@]}"; do
+    if retry 2 "$NET_RETRY_DELAY" recv_key "$key" && pacman-key --lsign-key "$key"; then
+      imported=$((imported + 1))
+    else
+      echo "Chaotic-AUR key $key could not be imported and signed." >&2
+    fi
+  done
+  [ "$imported" -gt 0 ] || return 1
+
+  retry "$NET_ATTEMPTS" "$NET_RETRY_DELAY" pacman_yes -U --noconfirm \
+      "$CHAOTIC_PKG_URL/chaotic-keyring.pkg.tar.zst" "$CHAOTIC_PKG_URL/chaotic-mirrorlist.pkg.tar.zst" || return 1
+  pacman-key --populate chaotic || return 1
+  [ -s /etc/pacman.d/chaotic-mirrorlist ]
+}
+
+# Artix only: the AURIS repository's signing key.
+setup_auris_key() {
+  local tmp
+  tmp=$(mktemp) || return 1
+  if fetch "$AURIS_KEY_URL" "$tmp" \
+       && gpg --show-keys "$tmp" \
+       && pacman-key --add "$tmp" \
+       && pacman-key --lsign-key "$AURIS_KEY_FPR"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# Writes pacman.conf from the current REPO_* flags, then proves the databases really sync with it.
+repo_conf_works() {
+  local tries="$1"
+  write_pacman_conf "$DISTRO" "$REPO_CPU" "$REPO_ALHP" "$REPO_CHAOTIC" "$REPO_AURIS" || return 1
+  retry "$tries" "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm
+}
+
+# Switches one optional repo on (REPO_AURIS / REPO_CHAOTIC / REPO_ALHP) and keeps it only if the
+# databases still sync with it. Otherwise it goes off again and pacman.conf returns to the last
+# configuration that worked.
+try_optional_repo() {
+  local flag="$1" label="$2"
+  printf -v "$flag" '%s' true
+  repo_conf_works 2 && return 0
+  printf -v "$flag" '%s' false
+  echo "$label: the package databases would not sync with it enabled; continuing without it." >&2
+  note_repo "$label was left out (its package database would not download)."
+  write_pacman_conf "$DISTRO" "$REPO_CPU" "$REPO_ALHP" "$REPO_CHAOTIC" "$REPO_AURIS"
+  return 1
+}
+
+# ALHP (x86-64-v3/v4 builds of the Arch packages): its keyring and mirrorlist are built with paru as an
+# unprivileged user, because makepkg refuses to run as root.
+setup_alhp() {
+  local build_user="sal-builder" built=false
+  id "$build_user" >/dev/null 2>&1 || useradd -m -G wheel "$build_user"
+  echo "$build_user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-sal-builder
+  chmod 440 /etc/sudoers.d/99-sal-builder
+
+  # The timeout keeps a stalled AUR download from hanging the installer for ever.
+  if timeout 1500 runuser -l "$build_user" -c 'paru -S --noconfirm --needed alhp-keyring alhp-mirrorlist' < <(yes ''); then
+    built=true
+  else
+    echo "Building alhp-keyring/alhp-mirrorlist failed; continuing without ALHP repos." >&2
+    note_repo "ALHP was left out (its keyring and mirrorlist could not be built)."
+  fi
+  rm -f /etc/sudoers.d/99-sal-builder
+  userdel -r "$build_user" >/dev/null 2>&1
+
+  if [ "$built" = true ]; then
+    pacman-key --populate alhp || true
+    try_optional_repo REPO_ALHP "ALHP"
+  fi
+}
+
+rank_mirrors() {
+  local out ok=false
+  out=$(mktemp) || return 1
+
+  if [ "$DISTRO" = "artix" ]; then
+    timeout "$RANKMIRRORS_TIMEOUT" rankmirrors -n 5 -m "$RANKMIRRORS_PER_MIRROR_TIMEOUT" /etc/pacman.d/mirrorlist > "$out" \
+      && grep -q "^Server" "$out" && ok=true
+  elif pacman_yes -S --noconfirm --needed rate-mirrors \
+         && timeout 120 rate-mirrors --allow-root --save="$out" --protocol https arch --max-delay=43200 \
+         && grep -q "^Server" "$out"; then
+    ok=true
+  elif pacman_yes -S --noconfirm --needed reflector \
+         && timeout 90 reflector --protocol https --age 12 --latest 100 --number 10 --sort rate \
+              --threads 20 --connection-timeout 3 --download-timeout 3 --save "$out" \
+         && grep -q "^Server" "$out"; then
+    ok=true
+  elif timeout "$RANKMIRRORS_TIMEOUT" rankmirrors -n 5 -m "$RANKMIRRORS_PER_MIRROR_TIMEOUT" /etc/pacman.d/mirrorlist > "$out" \
+         && grep -q "^Server" "$out"; then
+    ok=true
+  fi
+
+  if [ "$ok" = true ] \
+     && install -m 644 "$out" /etc/pacman.d/mirrorlist.new \
+     && mv -f /etc/pacman.d/mirrorlist.new /etc/pacman.d/mirrorlist; then
+    rm -f "$out"
+    return 0
+  fi
+  rm -f "$out" /etc/pacman.d/mirrorlist.new
+  return 1
 }
 
 setup_repo_integration() {
-  local CPU_LEVEL
-### IMPORT REPOSITORY KEYS ###
-echo "Importing repository keys..."
+  local auris_key_ok=false chaotic_ok=false
+  REPO_CHAOTIC=false REPO_AURIS=false REPO_ALHP=false
+  REPO_CPU=$(detect_cpu_level)
 
-pacman-key --init
+  echo "Importing repository keys..."
+  pacman-key --init || echo "pacman-key --init reported a problem; carrying on." >&2
 
-curl -s https://raw.githubusercontent.com/chaotic-aur/.github/refs/heads/main/profile/README.md \
-    | grep -Eo "pacman-key --recv-key [0-9A-F]+" \
-    | sed "s/--recv-key \([0-9A-F]*\)/--recv-key \1; pacman-key --lsign-key \1/" \
-    | bash
-
-if [ "$DISTRO" = "artix" ]; then
-    curl https://auris.artixlinux.org/api/packages/auris/arch/repository.key -o /root/auris.key
-    gpg --show-keys /root/auris.key
-    pacman-key --add /root/auris.key
-    pacman-key --lsign-key 74E5750C4A3C00F037070EF2357B525A97500B9F
-    rm -f /root/auris.key
-
-    pacman -Sy --noconfirm --needed artix-archlinux-support pacman-contrib artix-keyring archlinux-keyring artix-mirrorlist archlinux-mirrorlist < <(yes '')
+  if [ "$DISTRO" = "artix" ]; then
+    if setup_auris_key; then
+      auris_key_ok=true
+    else
+      echo "The Artix AURIS signing key could not be imported; continuing without the AURIS repo." >&2
+      note_repo "The AURIS repository was left out (its signing key could not be downloaded)."
+    fi
+    retry "$NET_ATTEMPTS" "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm --needed \
+        artix-archlinux-support pacman-contrib artix-keyring archlinux-keyring artix-mirrorlist archlinux-mirrorlist \
+      || { repo_setup_failed; return 1; }
     pacman-key --populate archlinux artix
-else
-    pacman -Sy --noconfirm --needed pacman-contrib archlinux-keyring < <(yes '')
+  else
+    retry "$NET_ATTEMPTS" "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm --needed pacman-contrib archlinux-keyring \
+      || { repo_setup_failed; return 1; }
     pacman-key --populate archlinux
-fi
+  fi
+  repo_conf_works "$NET_ATTEMPTS" || { repo_setup_failed; return 1; }
 
-pacman -U --noconfirm \
-    'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
-    'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' < <(yes '')
-pacman-key --populate chaotic
+  if [ "$auris_key_ok" = true ]; then
+    try_optional_repo REPO_AURIS "AURIS"
+  fi
 
-write_pacman_conf "$DISTRO" "" false
+  if setup_chaotic; then
+    chaotic_ok=true
+  else
+    echo "Chaotic-AUR could not be set up; continuing without it." >&2
+    note_repo "Chaotic-AUR could not be set up, so packages only it provides were left out."
+  fi
+  if [ "$chaotic_ok" = true ]; then
+    try_optional_repo REPO_CHAOTIC "Chaotic-AUR"
+  fi
 
-pacman -Sy --noconfirm --needed paru base-devel git < <(yes '')
+  # paru comes from Chaotic-AUR or AURIS, and it is only needed to build the ALHP keyring/mirrorlist.
+  if [ -z "$REPO_CPU" ]; then
+    echo "CPU is below x86-64-v3: not adding the ALHP repositories."
+  elif [ "$REPO_CHAOTIC" != true ] && [ "$REPO_AURIS" != true ]; then
+    echo "Neither Chaotic-AUR nor AURIS is available, so paru can't be installed: not adding the ALHP repositories." >&2
+    note_repo "ALHP was left out (it needs paru, which comes from Chaotic-AUR or AURIS)."
+  elif ! retry 3 "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm --needed paru base-devel git; then
+    echo "paru could not be installed: not adding the ALHP repositories." >&2
+    note_repo "ALHP was left out (paru could not be installed)."
+  else
+    setup_alhp
+  fi
 
-local build_user="sal-builder"
-local alhp_ok=false
-id "$build_user" >/dev/null 2>&1 || useradd -m -G wheel "$build_user"
-echo "$build_user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-sal-builder
-chmod 440 /etc/sudoers.d/99-sal-builder
+  echo "Configured pacman repos (distro: $DISTRO, CPU level: ${REPO_CPU:-baseline}, Chaotic-AUR: $REPO_CHAOTIC, AURIS: $REPO_AURIS, ALHP: $REPO_ALHP)."
+  return 0
+}
 
-if runuser -l "$build_user" -c 'paru -S --noconfirm --needed alhp-keyring alhp-mirrorlist' < <(yes ''); then
-  alhp_ok=true
-else
-  echo "Building alhp-keyring/alhp-mirrorlist failed; continuing without ALHP repos." >&2
-fi
-rm -f /etc/sudoers.d/99-sal-builder
-userdel -r "$build_user" >/dev/null 2>&1
+# The step that runs before partitioning: repositories, then the quickest mirrors.
+do_prepare_repos() {
+  net_report
+  setup_repo_integration || return 1
 
-CPU_LEVEL=$(detect_cpu_level)
-echo "Configuring pacman repos (distro: $DISTRO, CPU level: ${CPU_LEVEL:-baseline}, ALHP repos available: $alhp_ok)..."
-
-local repo_label="chaotic-aur"
-[ "$DISTRO" = "artix" ] && repo_label="chaotic-aur/auris"
-
-if [ -z "$CPU_LEVEL" ]; then
-    echo "CPU is below x86-64-v3 — writing a baseline config with $repo_label but no ALHP repos." >&2
-elif [ "$alhp_ok" != "true" ]; then
-    echo "CPU supports x86-64-$CPU_LEVEL but ALHP repos failed to build — writing Architecture=x86_64 x86_64_$CPU_LEVEL with $repo_label but no ALHP repos." >&2
-fi
-
-write_pacman_conf "$DISTRO" "$CPU_LEVEL" "$alhp_ok"
+  echo "Ranking mirrors (this can take a few minutes)..."
+  cp -f /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.sal-orig 2>/dev/null || true
+  if rank_mirrors; then
+    echo "Quickest mirrors written to /etc/pacman.d/mirrorlist."
+    if ! retry 3 "$NET_RETRY_DELAY" pacman_yes -Syy --noconfirm; then
+      echo "The package databases would not refresh from the ranked mirrors; going back to the original mirrorlist." >&2
+      [ -f /etc/pacman.d/mirrorlist.sal-orig ] && cp -f /etc/pacman.d/mirrorlist.sal-orig /etc/pacman.d/mirrorlist
+      retry "$NET_ATTEMPTS" "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm || { repo_setup_failed; return 1; }
+    fi
+  else
+    echo "Mirror ranking failed or timed out; keeping the current mirrorlist." >&2
+  fi
+  return 0
 }
 
 ### PERSISTENT PACKAGE INSTALLATION ###
+# True if an enabled repository offers the package (or a group of that name).
+pkg_in_repos() {
+  pacman -Si "$1" >/dev/null 2>&1 || pacman -Sg "$1" 2>/dev/null | grep -q .
+}
+
 target_has_pkg() {
   pacman -r "$TARGET" -Qi "$1" >/dev/null 2>&1 \
     || pacman -r "$TARGET" -Qg "$1" >/dev/null 2>&1
@@ -1052,18 +1361,7 @@ install_group() {
 }
 
 do_bootstrap() {
-  echo "Ranking mirrors (this can take a minute)..."
-  if timeout "$RANKMIRRORS_TIMEOUT" rankmirrors -n 6 -m "$RANKMIRRORS_PER_MIRROR_TIMEOUT" /etc/pacman.d/mirrorlist \
-       > /etc/pacman.d/mirrorlist.ranked 2>/dev/null \
-     && grep -qE '^[[:space:]]*Server[[:space:]]*=' /etc/pacman.d/mirrorlist.ranked; then
-    mv /etc/pacman.d/mirrorlist.ranked /etc/pacman.d/mirrorlist
-  else
-    echo "Mirror ranking failed, timed out, or produced no servers; keeping the default mirrorlist." >&2
-    rm -f /etc/pacman.d/mirrorlist.ranked
-  fi
-
-  setup_repo_integration
-
+  # The repositories and the mirrorlist were prepared by do_prepare_repos, before the disk was touched.
   local nm_svc_pkg="" dbus_svc_pkg=""
   if [ "$INIT_SYSTEM" != "systemd" ]; then
     nm_svc_pkg=$(init_svc_pkg networkmanager)
@@ -1096,6 +1394,20 @@ do_bootstrap() {
     local dm_svc_pkg; dm_svc_pkg=$(init_svc_pkg "$dm_pkg")
     [ -n "$dm_svc_pkg" ] && optional_packages+=("$dm_svc_pkg")
   fi
+
+  # A package that no enabled repository offers (librewolf and the legacy NVIDIA driver come from
+  # Chaotic-AUR, which may be unavailable) would fail the whole transaction on every attempt, so it is
+  # set aside now and listed in the "skipped" message at the end instead.
+  local available_packages=() pkg
+  for pkg in "${optional_packages[@]}"; do
+    if pkg_in_repos "$pkg"; then
+      available_packages+=("$pkg")
+    else
+      echo "$pkg is not offered by any enabled repository; skipping it." >&2
+      FAILED_PACKAGES+=("$pkg")
+    fi
+  done
+  optional_packages=("${available_packages[@]}")
 
   echo "Running $STRAP_CMD ($DISTRO_LABEL base system + $INIT_SYSTEM + kernel + bootloader + $(de_label "$DE_CHOICE"))..."
   if ! strap_batch "Full package set" "${critical_packages[@]}" "${optional_packages[@]}"; then
@@ -1505,12 +1817,20 @@ do_configure() {
   rm -f "$TARGET/root/sal-configure.sh"
 }
 
+# " - first note\n - second note": one bullet per line, written with the \n sequences that dialog turns
+# into line breaks (dialog would otherwise run real newlines together into one paragraph).
+dialog_bullets() { printf '%s' " - ${1//$'\n'/\\n - }"; }
+
 finish_screen() {
   mkdir -p "$TARGET/var/log" 2>/dev/null
   cp "$LOG" "$TARGET/var/log/sal-install.log" 2>/dev/null || true
   if [ -n "$SKIPPED_PACKAGES" ]; then
     dialog --backtitle "$BACKTITLE" --title "Packages skipped" --msgbox \
-"These packages could not be installed after $STRAP_MAX_ATTEMPTS attempts each\nand were skipped:\n\n$SKIPPED_PACKAGES\n\nThe system is installed and bootable. You can install them\nlater with pacman. Details are in /var/log/sal-install.log." 22 70 1>/dev/tty
+"These packages were skipped: none of the repositories that could be\nreached offers them, or their downloads kept failing:\n\n$SKIPPED_PACKAGES\n\nThe system is installed and bootable. You can install them\nlater with pacman. Details are in /var/log/sal-install.log." 22 70 1>/dev/tty
+  fi
+  if [ -n "$REPO_NOTES" ]; then
+    dialog --backtitle "$BACKTITLE" --title "Repositories" --msgbox \
+"Some optional repositories could not be set up:\n\n$(dialog_bullets "$REPO_NOTES")\n\nThe system is installed and bootable. Details are in\n/var/log/sal-install.log." 22 70 1>/dev/tty
   fi
   swapoff "$SWAP_PART" >/dev/null 2>&1 || true
   umount -R "$TARGET" >/dev/null 2>&1 || echo "Could not cleanly unmount $TARGET; safe to reboot anyway." >&2
@@ -1526,6 +1846,8 @@ finish_screen() {
 main() {
   : > "$LOG" 2>/dev/null || LOG="/tmp/sal-install.log"; : > "$LOG"
   preflight_root
+  prune_broken_repos /etc/pacman.conf '^(auris|chaotic-aur|.+-x86-64-v[34])$'
+  preflight_network
   preflight_cowspace
   preflight_tools
 
@@ -1551,6 +1873,11 @@ main() {
   transition_screen "Starting installation..."
 
   SWAP_PARTUUID=$(</proc/sys/kernel/random/uuid)
+
+  run_part "Preparing package repositories..." do_prepare_repos
+  # do_prepare_repos runs in a subshell, so its notes for the final screen come back through a file.
+  [ -f "$WORKDIR/repo_notes" ] && REPO_NOTES=$(<"$WORKDIR/repo_notes")
+
   run_part "Partitioning $DISK..." do_partitioning
   [ -f "$WORKDIR/luks_uuid" ] && LUKS_UUID=$(<"$WORKDIR/luks_uuid")
 
