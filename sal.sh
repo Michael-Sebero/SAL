@@ -41,8 +41,6 @@ CURL_OPTS=(--fail --silent --show-error --location --connect-timeout 15 --max-ti
 CHAOTIC_README_URL="https://raw.githubusercontent.com/chaotic-aur/.github/refs/heads/main/profile/README.md"
 CHAOTIC_FALLBACK_KEY="3056513887B78AEB"     # only used if the README above can't be fetched or parsed
 CHAOTIC_PKG_URL="https://cdn-mirror.chaotic.cx/chaotic-aur"
-AURIS_KEY_URL="https://auris.artixlinux.org/api/packages/auris/arch/repository.key"
-AURIS_KEY_FPR="74E5750C4A3C00F037070EF2357B525A97500B9F"
 
 BACKTITLE="Simple Arch/Artix Linux"
 HAVE_DIALOG=0
@@ -56,7 +54,7 @@ ENCRYPT="no" LUKS_UUID="" LUKS_PASS=""
 TIMEZONE="" LOCALE="" KEYMAP=""
 FAILED_PACKAGES=() STRAP_SKIPPED=()
 SKIPPED_PACKAGES="" REPO_NOTES=""
-REPO_CHAOTIC=false REPO_AURIS=false REPO_ALHP=false REPO_CPU=""
+REPO_CHAOTIC=false REPO_ALHP=false REPO_CPU=""
 
 part_path() { case "$1" in *[0-9]) printf '%sp%s' "$1" "$2" ;; *) printf '%s%s' "$1" "$2" ;; esac; }
 
@@ -258,7 +256,7 @@ net_report() {
   local host rc
   echo "Network check ($(date -u '+%F %T') UTC):"
   for host in archlinux.org raw.githubusercontent.com keyserver.ubuntu.com \
-              cdn-mirror.chaotic.cx geo-mirror.chaotic.cx auris.artixlinux.org aur.archlinux.org; do
+              cdn-mirror.chaotic.cx geo-mirror.chaotic.cx aur.archlinux.org; do
     curl --silent --head --connect-timeout 8 --max-time 15 -o /dev/null "https://$host/" 2>/dev/null
     rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -991,7 +989,7 @@ detect_cpu_level() {
 }
 
 write_pacman_conf() {
-  local distro="$1" cpu_level="$2" alhp_ok="$3" chaotic_ok="${4:-false}" auris_ok="${5:-false}"
+  local distro="$1" cpu_level="$2" alhp_ok="$3" chaotic_ok="${4:-false}"
   local conf="${PACMAN_CONF:-/etc/pacman.conf}"
   local arch_line base_mirrorlist native_repos tiered_repos repo
 
@@ -1030,9 +1028,6 @@ write_pacman_conf() {
     # Third-party repos are only written once they have been set up AND their databases have been
     # seen to sync (see setup_repo_integration). A pacman.conf that Includes a file which was never
     # installed makes every pacman command fail, so such a config is never written.
-    if [ "$distro" = "artix" ] && [ "$auris_ok" = "true" ]; then
-      printf '[auris]\nSigLevel = Required\nServer = https://auris.artixlinux.org/api/packages/auris/arch/$repo/$arch\n\n'
-    fi
     if [ "$chaotic_ok" = "true" ]; then
       printf '[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n\n'
     fi
@@ -1113,29 +1108,14 @@ setup_chaotic() {
   [ -s /etc/pacman.d/chaotic-mirrorlist ]
 }
 
-# Artix only: the AURIS repository's signing key.
-setup_auris_key() {
-  local tmp
-  tmp=$(mktemp) || return 1
-  if fetch "$AURIS_KEY_URL" "$tmp" \
-       && gpg --show-keys "$tmp" \
-       && pacman-key --add "$tmp" \
-       && pacman-key --lsign-key "$AURIS_KEY_FPR"; then
-    rm -f "$tmp"
-    return 0
-  fi
-  rm -f "$tmp"
-  return 1
-}
-
 # Writes pacman.conf from the current REPO_* flags, then proves the databases really sync with it.
 repo_conf_works() {
   local tries="$1"
-  write_pacman_conf "$DISTRO" "$REPO_CPU" "$REPO_ALHP" "$REPO_CHAOTIC" "$REPO_AURIS" || return 1
+  write_pacman_conf "$DISTRO" "$REPO_CPU" "$REPO_ALHP" "$REPO_CHAOTIC" || return 1
   retry "$tries" "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm
 }
 
-# Switches one optional repo on (REPO_AURIS / REPO_CHAOTIC / REPO_ALHP) and keeps it only if the
+# Switches one optional repo on (REPO_CHAOTIC / REPO_ALHP) and keeps it only if the
 # databases still sync with it. Otherwise it goes off again and pacman.conf returns to the last
 # configuration that worked.
 try_optional_repo() {
@@ -1145,7 +1125,7 @@ try_optional_repo() {
   printf -v "$flag" '%s' false
   echo "$label: the package databases would not sync with it enabled; continuing without it." >&2
   note_repo "$label was left out (its package database would not download)."
-  write_pacman_conf "$DISTRO" "$REPO_CPU" "$REPO_ALHP" "$REPO_CHAOTIC" "$REPO_AURIS"
+  write_pacman_conf "$DISTRO" "$REPO_CPU" "$REPO_ALHP" "$REPO_CHAOTIC"
   return 1
 }
 
@@ -1205,20 +1185,14 @@ rank_mirrors() {
 }
 
 setup_repo_integration() {
-  local auris_key_ok=false chaotic_ok=false
-  REPO_CHAOTIC=false REPO_AURIS=false REPO_ALHP=false
+  local chaotic_ok=false
+  REPO_CHAOTIC=false REPO_ALHP=false
   REPO_CPU=$(detect_cpu_level)
 
   echo "Importing repository keys..."
   pacman-key --init || echo "pacman-key --init reported a problem; carrying on." >&2
 
   if [ "$DISTRO" = "artix" ]; then
-    if setup_auris_key; then
-      auris_key_ok=true
-    else
-      echo "The Artix AURIS signing key could not be imported; continuing without the AURIS repo." >&2
-      note_repo "The AURIS repository was left out (its signing key could not be downloaded)."
-    fi
     retry "$NET_ATTEMPTS" "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm --needed \
         artix-archlinux-support pacman-contrib artix-keyring archlinux-keyring artix-mirrorlist archlinux-mirrorlist \
       || { repo_setup_failed; return 1; }
@@ -1230,10 +1204,6 @@ setup_repo_integration() {
   fi
   repo_conf_works "$NET_ATTEMPTS" || { repo_setup_failed; return 1; }
 
-  if [ "$auris_key_ok" = true ]; then
-    try_optional_repo REPO_AURIS "AURIS"
-  fi
-
   if setup_chaotic; then
     chaotic_ok=true
   else
@@ -1244,12 +1214,12 @@ setup_repo_integration() {
     try_optional_repo REPO_CHAOTIC "Chaotic-AUR"
   fi
 
-  # paru comes from Chaotic-AUR or AURIS, and it is only needed to build the ALHP keyring/mirrorlist.
+  # paru comes from Chaotic-AUR, and it is only needed to build the ALHP keyring/mirrorlist.
   if [ -z "$REPO_CPU" ]; then
     echo "CPU is below x86-64-v3: not adding the ALHP repositories."
-  elif [ "$REPO_CHAOTIC" != true ] && [ "$REPO_AURIS" != true ]; then
-    echo "Neither Chaotic-AUR nor AURIS is available, so paru can't be installed: not adding the ALHP repositories." >&2
-    note_repo "ALHP was left out (it needs paru, which comes from Chaotic-AUR or AURIS)."
+  elif [ "$REPO_CHAOTIC" != true ]; then
+    echo "Chaotic-AUR is not available, so paru can't be installed: not adding the ALHP repositories." >&2
+    note_repo "ALHP was left out (it needs paru, which comes from Chaotic-AUR)."
   elif ! retry 3 "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm --needed paru base-devel git; then
     echo "paru could not be installed: not adding the ALHP repositories." >&2
     note_repo "ALHP was left out (paru could not be installed)."
@@ -1257,7 +1227,7 @@ setup_repo_integration() {
     setup_alhp
   fi
 
-  echo "Configured pacman repos (distro: $DISTRO, CPU level: ${REPO_CPU:-baseline}, Chaotic-AUR: $REPO_CHAOTIC, AURIS: $REPO_AURIS, ALHP: $REPO_ALHP)."
+  echo "Configured pacman repos (distro: $DISTRO, CPU level: ${REPO_CPU:-baseline}, Chaotic-AUR: $REPO_CHAOTIC, ALHP: $REPO_ALHP)."
   return 0
 }
 
@@ -1846,7 +1816,7 @@ finish_screen() {
 main() {
   : > "$LOG" 2>/dev/null || LOG="/tmp/sal-install.log"; : > "$LOG"
   preflight_root
-  prune_broken_repos /etc/pacman.conf '^(auris|chaotic-aur|.+-x86-64-v[34])$'
+  prune_broken_repos /etc/pacman.conf '^(chaotic-aur|.+-x86-64-v[34])$'
   preflight_network
   preflight_cowspace
   preflight_tools
