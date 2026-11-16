@@ -38,9 +38,15 @@ NET_ATTEMPTS=4
 NET_RETRY_DELAY=5
 KEYSERVERS=(hkps://keyserver.ubuntu.com hkp://keyserver.ubuntu.com:80)
 CURL_OPTS=(--fail --silent --show-error --location --connect-timeout 15 --max-time 60)
-CHAOTIC_README_URL="https://raw.githubusercontent.com/chaotic-aur/.github/refs/heads/main/profile/README.md"
-CHAOTIC_FALLBACK_KEY="3056513887B78AEB"     # only used if the README above can't be fetched or parsed
+# The Chaotic-AUR signing key is never written down in this script: it is read from the project's own
+# README (which is where its setup instructions live), so a key rotation there is picked up automatically.
+CHAOTIC_README_URLS=(
+  "https://raw.githubusercontent.com/chaotic-aur/.github/refs/heads/main/profile/README.md"
+  "https://raw.githubusercontent.com/chaotic-aur/.github/main/profile/README.md"
+  "https://github.com/chaotic-aur/.github/raw/refs/heads/main/profile/README.md"
+)
 CHAOTIC_PKG_URL="https://cdn-mirror.chaotic.cx/chaotic-aur"
+AUR_SNAPSHOT_URL="https://aur.archlinux.org/cgit/aur.git/snapshot"
 
 BACKTITLE="Simple Arch/Artix Linux"
 HAVE_DIALOG=0
@@ -563,7 +569,7 @@ fs_packages() {
 
 de_packages() {
   case "$1" in
-    kde)      printf '%s' "plasma-meta sddm dolphin konsole plasma-nm" ;;
+    kde)      printf '%s' "plasma-meta sddm sddm-kcm dolphin konsole plasma-nm gwenview ffmpegthumbs" ;;
     gnome)    printf '%s' "gnome gnome-tweaks gdm" ;;
     xfce)     printf '%s' "xfce4 xfce4-goodies lightdm lightdm-gtk-greeter network-manager-applet" ;;
     mate)     printf '%s' "mate mate-extra lightdm lightdm-gtk-greeter network-manager-applet" ;;
@@ -1072,28 +1078,39 @@ recv_key() {
   return 1
 }
 
-# The key IDs the Chaotic-AUR README tells you to import. If the README can't be fetched or has
-# changed shape, the primary key it has always listed is used instead.
-chaotic_key_ids() {
-  local tmp ids=""
-  tmp=$(mktemp) || { printf '%s\n' "$CHAOTIC_FALLBACK_KEY"; return 0; }
-  if fetch "$CHAOTIC_README_URL" "$tmp"; then
-    ids=$(grep -Eo 'pacman-key --recv-keys? [0-9A-Fa-f]{8,40}' "$tmp" | awk '{print $3}' | sort -u)
-  fi
+# Reads the Chaotic-AUR README and fills CHAOTIC_KEYS with the key(s) it tells you to import, and
+# CHAOTIC_KEYSERVER with the keyserver it names (if any). There is deliberately no built-in key: if the
+# README can't be read, Chaotic-AUR is left out rather than trusting a key that may have been rotated.
+CHAOTIC_KEYS=() CHAOTIC_KEYSERVER=""
+chaotic_readme_info() {
+  local tmp url ids
+  CHAOTIC_KEYS=() CHAOTIC_KEYSERVER=""
+  tmp=$(mktemp) || return 1
+  for url in "${CHAOTIC_README_URLS[@]}"; do
+    retry 2 "$NET_RETRY_DELAY" curl "${CURL_OPTS[@]}" -o "$tmp" "$url" || continue
+    ids=$(grep -Eo '(recv-keys?|lsign-key)[[:space:]]+(0x)?[0-9A-Fa-f]{16,40}' "$tmp" \
+            | awk '{k=$2; sub(/^0x/, "", k); print toupper(k)}' | sort -u)
+    [ -n "$ids" ] || { echo "No key ID found in the Chaotic-AUR README at $url." >&2; continue; }
+    mapfile -t CHAOTIC_KEYS <<<"$ids"
+    CHAOTIC_KEYSERVER=$(grep -Eo -- '--keyserver[[:space:]]+[A-Za-z0-9./:_-]+' "$tmp" | awk '{print $2; exit}')
+    rm -f "$tmp"
+    return 0
+  done
   rm -f "$tmp"
-  if [ -z "$ids" ]; then
-    echo "Could not read a key ID from the Chaotic-AUR README; using the built-in one." >&2
-    ids="$CHAOTIC_FALLBACK_KEY"
-  fi
-  printf '%s\n' "$ids"
+  echo "Could not read the Chaotic-AUR signing key from its README." >&2
+  return 1
 }
 
-# Chaotic-AUR exactly as its README sets it up (keys, keyring, mirrorlist), except that every step is
-# retried and nothing is taken for granted. Succeeds only if the mirrorlist file really exists afterwards.
+# Chaotic-AUR as its README sets it up (keys, keyring, mirrorlist), except that every step is retried
+# and nothing is taken for granted. Succeeds only if the mirrorlist file really exists afterwards.
 setup_chaotic() {
-  local key keys=() imported=0
-  mapfile -t keys < <(chaotic_key_ids)
-  for key in "${keys[@]}"; do
+  local key imported=0
+  chaotic_readme_info || return 1
+  if [ -n "$CHAOTIC_KEYSERVER" ]; then   # the keyserver the README names goes first
+    case "$CHAOTIC_KEYSERVER" in *://*) ;; *) CHAOTIC_KEYSERVER="hkps://$CHAOTIC_KEYSERVER" ;; esac
+    KEYSERVERS=("$CHAOTIC_KEYSERVER" "${KEYSERVERS[@]}")
+  fi
+  for key in "${CHAOTIC_KEYS[@]}"; do
     if retry 2 "$NET_RETRY_DELAY" recv_key "$key" && pacman-key --lsign-key "$key"; then
       imported=$((imported + 1))
     else
@@ -1129,27 +1146,57 @@ try_optional_repo() {
   return 1
 }
 
-# ALHP (x86-64-v3/v4 builds of the Arch packages): its keyring and mirrorlist are built with paru as an
-# unprivileged user, because makepkg refuses to run as root.
-setup_alhp() {
-  local build_user="sal-builder" built=false
-  id "$build_user" >/dev/null 2>&1 || useradd -m -G wheel "$build_user"
-  echo "$build_user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-sal-builder
-  chmod 440 /etc/sudoers.d/99-sal-builder
+# Builds alhp-keyring and alhp-mirrorlist from their AUR snapshots with plain makepkg (no AUR helper),
+# as an unprivileged user because makepkg refuses to run as root. Only used when Chaotic-AUR, which
+# ships both packages prebuilt, is not available.
+build_alhp_from_aur() {
+  local build_user="sal-builder" dir pkg home keys ok=true
+  retry 3 "$NET_RETRY_DELAY" pacman_yes -S --noconfirm --needed base-devel git || return 1
+  id "$build_user" >/dev/null 2>&1 || useradd -m "$build_user" || return 1
+  home=$(getent passwd "$build_user" | cut -d: -f6)
+  dir=$(mktemp -d) || return 1
+  chown "$build_user" "$dir"
+  for pkg in alhp-keyring alhp-mirrorlist; do
+    fetch "$AUR_SNAPSHOT_URL/$pkg.tar.gz" "$dir/$pkg.tar.gz" \
+      && tar -xzf "$dir/$pkg.tar.gz" -C "$dir" \
+      && chown -R "$build_user" "$dir/$pkg" \
+      || { echo "Downloading $pkg from the AUR failed." >&2; ok=false; break; }
+    # makepkg verifies the source signature against the keys the PKGBUILD itself names (validpgpkeys).
+    keys=$(sed -n '/^validpgpkeys=/,/)/p' "$dir/$pkg/PKGBUILD" | grep -Eo '[0-9A-Fa-f]{40}')
+    if [ -n "$keys" ]; then
+      runuser -u "$build_user" -- env HOME="$home" timeout 90 \
+        gpg --batch --keyserver "${KEYSERVERS[0]}" --recv-keys $keys >/dev/null 2>&1 \
+        || echo "Could not fetch the signing key for $pkg; the build may fail." >&2
+    fi
+    timeout 600 runuser -u "$build_user" -- env HOME="$home" PKGDEST="$dir" BUILDDIR="$dir/build-$pkg" \
+        bash -c 'cd "$1" && makepkg --noconfirm --force' _ "$dir/$pkg" \
+      || { echo "Building $pkg from the AUR failed." >&2; ok=false; break; }
+  done
+  [ "$ok" = true ] && { pacman_yes -U --noconfirm "$dir"/alhp-keyring-*.pkg.tar.* "$dir"/alhp-mirrorlist-*.pkg.tar.* || ok=false; }
+  rm -rf "$dir"
+  userdel -r "$build_user" >/dev/null 2>&1
+  [ "$ok" = true ]
+}
 
-  # The timeout keeps a stalled AUR download from hanging the installer for ever.
-  if timeout 1500 runuser -l "$build_user" -c 'paru -S --noconfirm --needed alhp-keyring alhp-mirrorlist' < <(yes ''); then
+# ALHP (x86-64-v3/v4 builds of the Arch packages). Its keyring and mirrorlist are plain files with no
+# dependencies, so they are installed straight from Chaotic-AUR when it is available; paru is not needed
+# (and installing it on the live ISO would pull in a partial system upgrade).
+setup_alhp() {
+  local built=false
+  if [ "$REPO_CHAOTIC" = true ] \
+     && retry 3 "$NET_RETRY_DELAY" pacman_yes -S --noconfirm --needed chaotic-aur/alhp-keyring chaotic-aur/alhp-mirrorlist; then
     built=true
   else
-    echo "Building alhp-keyring/alhp-mirrorlist failed; continuing without ALHP repos." >&2
-    note_repo "ALHP was left out (its keyring and mirrorlist could not be built)."
+    echo "alhp-keyring/alhp-mirrorlist are not available from Chaotic-AUR; building them from the AUR..." >&2
+    build_alhp_from_aur && built=true
   fi
-  rm -f /etc/sudoers.d/99-sal-builder
-  userdel -r "$build_user" >/dev/null 2>&1
 
-  if [ "$built" = true ]; then
+  if [ "$built" = true ] && [ -s /etc/pacman.d/alhp-mirrorlist ]; then
     pacman-key --populate alhp || true
     try_optional_repo REPO_ALHP "ALHP"
+  else
+    echo "alhp-keyring/alhp-mirrorlist could not be installed; continuing without ALHP repos." >&2
+    note_repo "ALHP was left out (its keyring and mirrorlist could not be installed)."
   fi
 }
 
@@ -1214,15 +1261,8 @@ setup_repo_integration() {
     try_optional_repo REPO_CHAOTIC "Chaotic-AUR"
   fi
 
-  # paru comes from Chaotic-AUR, and it is only needed to build the ALHP keyring/mirrorlist.
   if [ -z "$REPO_CPU" ]; then
     echo "CPU is below x86-64-v3: not adding the ALHP repositories."
-  elif [ "$REPO_CHAOTIC" != true ]; then
-    echo "Chaotic-AUR is not available, so paru can't be installed: not adding the ALHP repositories." >&2
-    note_repo "ALHP was left out (it needs paru, which comes from Chaotic-AUR)."
-  elif ! retry 3 "$NET_RETRY_DELAY" pacman_yes -Sy --noconfirm --needed paru base-devel git; then
-    echo "paru could not be installed: not adding the ALHP repositories." >&2
-    note_repo "ALHP was left out (paru could not be installed)."
   else
     setup_alhp
   fi
@@ -1330,6 +1370,44 @@ install_group() {
   return 0
 }
 
+# True if pacman can install the given targets into an empty root from the current sync databases.
+# Only simulated (-p), against a scratch root and database copy, so nothing on the live system changes.
+RESOLVE_DIR=""
+can_resolve() {
+  pacman --root "$RESOLVE_DIR/root" --dbpath "$RESOLVE_DIR/db" --cachedir "$RESOLVE_DIR/cache" \
+         --gpgdir /etc/pacman.d/gnupg --logfile /dev/null -Sp --needed "$@" >/dev/null 2>&1
+}
+
+# Prints the targets to hand to pacstrap, one per line. A repository can offer a package whose own
+# dependencies no repository satisfies (Artix's plasma-meta, for instance, has asked for a kwin-x11 that
+# nothing provided), and because pacman takes the first repository that has a name, that broken copy hides
+# a working copy of the same package further down. Such a package is requested as repo/name instead.
+pick_working_sources() {
+  local pkg repo picked
+  RESOLVE_DIR=$(mktemp -d) || { printf '%s\n' "$@"; return 0; }
+  mkdir -p "$RESOLVE_DIR"/{root,cache,db/local,db/sync}
+  cp /var/lib/pacman/sync/*.db /var/lib/pacman/sync/*.db.sig "$RESOLVE_DIR/db/sync/" 2>/dev/null
+
+  if can_resolve "$@"; then
+    printf '%s\n' "$@"
+  else
+    for pkg in "$@"; do
+      picked=""
+      if ! can_resolve "$pkg"; then
+        for repo in $(pacman -Sl 2>/dev/null | awk -v p="$pkg" '$2 == p { print $1 }'); do
+          if can_resolve "$repo/$pkg"; then
+            picked="$repo/$pkg"
+            echo "$pkg can't be installed from the first repository that offers it; using $picked instead." >&2
+            break
+          fi
+        done
+      fi
+      printf '%s\n' "${picked:-$pkg}"
+    done
+  fi
+  rm -rf "$RESOLVE_DIR"
+}
+
 do_bootstrap() {
   # The repositories and the mirrorlist were prepared by do_prepare_repos, before the disk was touched.
   local nm_svc_pkg="" dbus_svc_pkg=""
@@ -1377,7 +1455,7 @@ do_bootstrap() {
       FAILED_PACKAGES+=("$pkg")
     fi
   done
-  optional_packages=("${available_packages[@]}")
+  mapfile -t optional_packages < <(pick_working_sources "${available_packages[@]}")
 
   echo "Running $STRAP_CMD ($DISTRO_LABEL base system + $INIT_SYSTEM + kernel + bootloader + $(de_label "$DE_CHOICE"))..."
   if ! strap_batch "Full package set" "${critical_packages[@]}" "${optional_packages[@]}"; then
